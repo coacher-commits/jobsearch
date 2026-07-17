@@ -23,7 +23,7 @@ import requests
 # ReliefWeb — ICRC + sistema ONU + ONGs de DIH / derechos humanos
 # Doc: https://apidoc.reliefweb.int/  (desde nov-2025 requiere appname aprobado)
 # ----------------------------------------------------------------------
-RELIEFWEB_URL = "https://api.reliefweb.int/v1/jobs"
+RELIEFWEB_URL = "https://api.reliefweb.int/v2/jobs"
 
 # Términos legales que deben aparecer EN EL TÍTULO (mantiene la señal alta)
 RW_TITLE_TERMS = [
