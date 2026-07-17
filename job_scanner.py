@@ -15,6 +15,7 @@ Uso local de prueba:  DRY_RUN=1 python job_scanner.py   (no envía email)
 
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -35,26 +36,27 @@ from org_scanner import fetch_reliefweb, org_links_html
 #    - "Spain": ofertas ubicadas en España.
 #    - remoto=True + "European Union": remotas europeas que pueden permitir España.
 # ----------------------------------------------------------------------
+# Todas las búsquedas son remotas (requisito: solo full remoto ES/UE).
 SEARCHES = [
     # --- Public international law / IHL / weapons law (núcleo del perfil) ---
-    ("public international law legal adviser", "Spain", False),
+    ("public international law legal adviser", "Spain", True),
     ("public international law legal adviser", "European Union", True),
-    ("international humanitarian law", "European Union", False),
-    ("international humanitarian law legal officer", "Spain", False),
-    ("weapons law arms control legal", "European Union", False),
+    ("international humanitarian law", "European Union", True),
+    ("international humanitarian law legal officer", "Spain", True),
+    ("weapons law arms control legal", "European Union", True),
     ("disarmament non-proliferation legal", "European Union", True),
     ("legal adviser international law", "European Union", True),
     # --- Researcher ---
-    ("legal researcher international law", "Spain", False),
+    ("legal researcher international law", "Spain", True),
     ("research fellow international law human rights", "European Union", True),
     ("researcher AI governance policy", "European Union", True),
     # --- Extras basados en el CV ---
-    ("legal officer international organisation", "Spain", False),
+    ("legal officer international organisation", "Spain", True),
     ("human rights legal officer", "European Union", True),
     ("regulatory counsel EU AI Act", "European Union", True),
     ("legal counsel data protection GDPR", "European Union", True),
     # --- Perfil comercial actual (transición) ---
-    ("legal counsel", "Spain", False),
+    ("legal counsel remote", "Spain", True),
     ("commercial legal counsel", "European Union", True),
 ]
 
@@ -110,10 +112,54 @@ KEYWORDS = {
     "spanish": 2,
 }
 
-# Descarta ofertas claramente fuera de perfil (junior / apoyo)
-EXCLUDE = [
+# ----------------------------------------------------------------------
+# 3. FILTROS DE EXCLUSIÓN (requisitos de Alvaro)
+# ----------------------------------------------------------------------
+MIN_YEARS_EXCLUDE = 4      # fuera si piden 4+ años de experiencia
+
+# Junior / apoyo (título o descripción)
+EXCLUDE_GENERIC = [
     "paralegal", "internship", "intern ", "prácticas", "practicas",
     "becario", "becaria", "trainee", "secretary", "assistant to",
+]
+
+# Docencia / academia (se comprueba sobre todo en el TÍTULO)
+EXCLUDE_ACADEMIC = [
+    "teacher", "professor", "lecturer", "faculty", "instructor", "tutor",
+    "teaching", "docente", "profesor", "catedrátic", "postdoc", "post-doc",
+    "phd student", "ph.d student", "doctoral", "university", "universidad",
+    "academic", "académic",
+]
+
+# Colegiación / bar admission (título o descripción)
+EXCLUDE_BAR = [
+    "bar admission", "admitted to the bar", "member of the bar",
+    "admission to the bar", "called to the bar", "state bar", "bar exam",
+    "bar association", "passed the bar", "bar qualified", "qualified to the bar",
+    "admitted to practice", "license to practice law", "licensed to practice law",
+    "colegiad", "colegio de abogados", "colegiación",
+]
+
+# Restricción geográfica incompatible con remoto desde España
+EXCLUDE_GEO = [
+    "must be based in the united states", "us-based only", "based in the us only",
+    "authorized to work in the united states", "u.s. work authorization",
+    "must reside in the united states", "us work authorization",
+    "eligible to work in the us", "must be located in the united states",
+    "canada only", "based in the uk only", "uk-based only", "onsite in",
+]
+
+# Señales de híbrido / presencial (rompen el requisito de FULL remoto)
+HYBRID_ONSITE = [
+    "hybrid", "híbrido", "hibrido", "on-site", "onsite", "on site",
+    "presencial", "in-office", "in office", "days in the office",
+    "days per week in the office", "días en la oficina", "relocation",
+]
+
+# Señales de remoto pleno
+REMOTE_POSITIVE = [
+    "remote", "fully remote", "100% remote", "remote-first", "work from home",
+    "home-based", "home based", "teletrabajo", "en remoto", "remoto", "anywhere",
 ]
 
 SEEN_FILE = Path("seen_jobs.json")
@@ -136,11 +182,62 @@ def _clean(x) -> str:
     return "" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x)
 
 
+def requires_senior_experience(text: str, threshold: int = MIN_YEARS_EXCLUDE) -> bool:
+    """True si TODAS las menciones de años de experiencia son >= threshold.
+    Rangos (p.ej. '2-4 años') usan el límite inferior; así '2-4' NO se descarta."""
+    t = text.lower()
+    reqs = []
+    # rangos: "2-4 years" / "2 a 4 años" -> límite inferior
+    for m in re.finditer(r"(\d{1,2})\s*(?:-|–|to|a)\s*\d{1,2}\s*\+?\s*(?:years?|yrs?|años?|año)", t):
+        _add_if_experience(t, m, int(m.group(1)), reqs)
+    # sueltos: "5+ years" / "mínimo 4 años" (número pegado a la unidad)
+    for m in re.finditer(r"(?<![\d\-–])(\d{1,2})\s*\+?\s*(?:years?|yrs?|años?|año)", t):
+        _add_if_experience(t, m, int(m.group(1)), reqs)
+    return bool(reqs) and min(reqs) >= threshold
+
+
+def _add_if_experience(text: str, match, value: int, out: list) -> None:
+    window = text[max(0, match.start() - 45): match.end() + 45]
+    if "experien" in window or "experience" in window:
+        out.append(value)
+
+
+def _has(text: str, terms) -> bool:
+    return any(t in text for t in terms)
+
+
+def excluded(row) -> bool:
+    title = _clean(row.get("title")).lower()
+    desc = _clean(row.get("description")).lower()
+    loc = _clean(row.get("location")).lower()
+    both = f"{title} {desc}"
+    if _has(both, EXCLUDE_GENERIC):
+        return True
+    if _has(title, EXCLUDE_ACADEMIC):
+        return True
+    if _has(both, EXCLUDE_BAR):
+        return True
+    if _has(f"{both} {loc}", EXCLUDE_GEO):
+        return True
+    if requires_senior_experience(both):
+        return True
+    return False
+
+
+def is_full_remote(row) -> bool:
+    """Solo full remoto: señal de remoto presente y sin marcas de híbrido/presencial."""
+    title = _clean(row.get("title")).lower()
+    desc = _clean(row.get("description")).lower()
+    loc = _clean(row.get("location")).lower()
+    text = f"{title} {desc} {loc}"
+    if _has(text, HYBRID_ONSITE):
+        return False
+    return bool(row.get("is_remote")) or _has(text, REMOTE_POSITIVE)
+
+
 def score_job(row) -> int:
     title = _clean(row.get("title")).lower()
     desc = _clean(row.get("description")).lower()
-    if any(x in f"{title} {desc}" for x in EXCLUDE):
-        return -1
     score = 0
     for kw, w in KEYWORDS.items():
         if kw in title:
@@ -249,6 +346,19 @@ def main():
         print("Todo ya visto; no se envía email.")
         return
 
+    # --- Filtros de Alvaro: fuera 4+ años, bar, academia, geo; solo full remoto ---
+    antes = len(jobs)
+    jobs = jobs[~jobs.apply(excluded, axis=1)]
+    jobs = jobs[jobs.apply(is_full_remote, axis=1)]
+    print(f"[filtros] {antes} -> {len(jobs)} tras excluir (experiencia/bar/academia/geo) "
+          f"y exigir full remoto")
+    if jobs.empty:
+        print("Nada pasa los filtros; no se envía email.")
+        seen.update(jobs["job_url"].tolist())
+        save_seen(seen)
+        return
+
+    jobs = jobs.copy()
     jobs["score"] = jobs.apply(score_job, axis=1)
     jobs = jobs[jobs["score"] >= SCORE_THRESHOLD]
     jobs = jobs.sort_values("score", ascending=False).head(MAX_JOBS_IN_EMAIL)
